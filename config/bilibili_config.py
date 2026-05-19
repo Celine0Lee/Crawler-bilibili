@@ -26,20 +26,36 @@ MAX_NOTES_PER_DAY = 1
 # - Full URL: "https://www.bilibili.com/video/BV1dwuKzmE26/?spm_id_from=333.1387.homepage.video_card.click"
 # - BV number: "BV1d54y1g7db"
 BILI_SPECIFIED_ID_LIST = [
-    "https://www.bilibili.com/video/BV1dwuKzmE26/?spm_id_from=333.1387.homepage.video_card.click",
+    # detail 模式：BV 或完整视频 URL（数据表「高赞案例 / 已知合作稿」可填在此后改 --type detail）
     "BV1Sz4y1U77N",
     "BV14Q4y1n7jz",
-    # ........................
 ]
 
+# creator 模式：每位 UP 仅处理「近 BILI_CREATOR_VIDEO_LOOKBACK_DAYS 天」投稿中点赞最高的前 BILI_CREATOR_TOP_LIKED_COUNT 条
+BILI_CREATOR_VIDEO_LOOKBACK_DAYS = 365
+BILI_CREATOR_TOP_LIKED_COUNT = 5
+BILI_CREATOR_LIST_PAGE_SIZE = 30
+
+# Comment crawl: "time" | "hot" | "mixed" (maps to CommentOrderType)
+BILI_COMMENT_ORDER_MODE = "time"
+# Level-1 comment page size for /x/v2/reply/wbi/main (ps)
+BILI_COMMENT_PAGE_SIZE = 20
+# Level-2 reply page size
+BILI_SUB_COMMENT_PAGE_SIZE = 20
+
 # Specify the URL list of Bilibili creators (supports full URL or UID)
-# Example:
-# - Full URL: "https://space.bilibili.com/434377496?spm_id_from=333.1007.0.0"
-# - UID: "20813884"
+# 论文样本 10 位 UP（UID 已通过 card / view 接口核对昵称）
 BILI_CREATOR_ID_LIST = [
-    "https://space.bilibili.com/434377496?spm_id_from=333.1007.0.0",
-    "20813884",
-    # ........................
+    "130636947",  # 塑料叉FOKU
+    "350632501",  # 在下小苏
+    "332432527",  # 彭酱酱LINYA
+    "11870568",  # 拉宏桑
+    "399558032",  # 剑桥的小里森
+    "375065148",  # 虞兮西西
+    "383038901",  # 锦堂生活空间
+    "8695736",  # 田浅浅
+    "382337524",  # 圈宁CeoxNim
+    "1340508433",  # 江酱的法语日记
 ]
 
 # Specify time range

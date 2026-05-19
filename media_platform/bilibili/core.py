@@ -338,7 +338,12 @@ class BilibiliCrawler(AbstractCrawler):
         for video_id in video_id_list:
             task = asyncio.create_task(self.get_comments(video_id, semaphore), name=video_id)
             task_list.append(task)
-        await asyncio.gather(*task_list)
+        results = await asyncio.gather(*task_list, return_exceptions=True)
+        for video_id, outcome in zip(video_id_list, results):
+            if isinstance(outcome, Exception):
+                utils.logger.error(
+                    f"[BilibiliCrawler.batch_get_video_comments] video_id={video_id} failed: {outcome}"
+                )
 
     async def get_comments(self, video_id: str, semaphore: asyncio.Semaphore):
         """
@@ -351,7 +356,6 @@ class BilibiliCrawler(AbstractCrawler):
             try:
                 utils.logger.info(f"[BilibiliCrawler.get_comments] begin get video_id: {video_id} comments ...")
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[BilibiliCrawler.get_comments] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching comments for video {video_id}")
                 await self.bili_client.get_video_all_comments(
                     video_id=video_id,
                     crawl_interval=config.CRAWLER_MAX_SLEEP_SEC,
@@ -359,30 +363,102 @@ class BilibiliCrawler(AbstractCrawler):
                     callback=bilibili_store.batch_update_bilibili_video_comments,
                     max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
                 )
-
             except DataFetchError as ex:
                 utils.logger.error(f"[BilibiliCrawler.get_comments] get video_id: {video_id} comment error: {ex}")
             except Exception as e:
-                utils.logger.error(f"[BilibiliCrawler.get_comments] may be been blocked, err:{e}")
-                # Propagate the exception to be caught by the main loop
-                raise
+                utils.logger.error(
+                    f"[BilibiliCrawler.get_comments] get video_id: {video_id} comment error (skipped): {e}"
+                )
 
     async def get_creator_videos(self, creator_id: int):
         """
-        get videos for a creator
-        :return:
+        List creator uploads (newest first), keep items published within the lookback window,
+        rank by like count from video detail API, then crawl only the top N with comments.
         """
-        ps = 30
+        lookback_days = int(getattr(config, "BILI_CREATOR_VIDEO_LOOKBACK_DAYS", 365))
+        top_n = int(getattr(config, "BILI_CREATOR_TOP_LIKED_COUNT", 5))
+        ps = int(getattr(config, "BILI_CREATOR_LIST_PAGE_SIZE", 30))
+
+        cutoff_ts = int((datetime.now() - timedelta(days=lookback_days)).timestamp())
+        in_window_bvids: List[str] = []
+        seen: set[str] = set()
         pn = 1
+
         while True:
-            result = await self.bili_client.get_creator_videos(creator_id, pn, ps)
-            video_bvids_list = [video["bvid"] for video in result["list"]["vlist"]]
-            await self.get_specified_videos(video_bvids_list)
-            if int(result["page"]["count"]) <= pn * ps:
+            result = await self.bili_client.get_creator_videos(
+                str(creator_id), pn, ps, SearchOrderType.LAST_PUBLISH
+            )
+            vlist = (result.get("list") or {}).get("vlist") or []
+            if not vlist:
                 break
+
+            for video in vlist:
+                created = video.get("created")
+                if created is None:
+                    continue
+                try:
+                    ts = int(created)
+                except (TypeError, ValueError):
+                    continue
+                if ts < cutoff_ts:
+                    continue
+                bvid = video.get("bvid")
+                if bvid and bvid not in seen:
+                    seen.add(bvid)
+                    in_window_bvids.append(bvid)
+
+            min_created = min(int(v.get("created") or 0) for v in vlist)
+            if min_created < cutoff_ts:
+                break
+
+            page_count = int((result.get("page") or {}).get("count") or 0)
+            if page_count <= pn * ps:
+                break
+
             await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-            utils.logger.info(f"[BilibiliCrawler.get_creator_videos] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {pn}")
+            utils.logger.info(
+                f"[BilibiliCrawler.get_creator_videos] creator={creator_id} "
+                f"list page {pn} done, sleep {config.CRAWLER_MAX_SLEEP_SEC}s"
+            )
             pn += 1
+
+        if not in_window_bvids:
+            utils.logger.warning(
+                f"[BilibiliCrawler.get_creator_videos] creator_id={creator_id} "
+                f"no videos in the last {lookback_days} days"
+            )
+            return
+
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        info_tasks = [
+            self.get_video_info_task(aid=0, bvid=bvid, semaphore=semaphore) for bvid in in_window_bvids
+        ]
+        video_details = await asyncio.gather(*info_tasks)
+
+        scored: List[Tuple[int, str]] = []
+        for detail in video_details:
+            if detail is None:
+                continue
+            view = detail.get("View") or {}
+            bvid = view.get("bvid")
+            stat = view.get("stat") or {}
+            if not bvid:
+                continue
+            try:
+                like_cnt = int(stat.get("like") or 0)
+            except (TypeError, ValueError):
+                like_cnt = 0
+            scored.append((like_cnt, bvid))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_bvids = [b for _, b in scored[:top_n]]
+        utils.logger.info(
+            f"[BilibiliCrawler.get_creator_videos] creator_id={creator_id} "
+            f"in_window={len(in_window_bvids)} selected_top={len(top_bvids)} bvids={top_bvids}"
+        )
+
+        source_keyword_var.set(f"creator:{creator_id}")
+        await self.get_specified_videos(top_bvids)
 
     async def get_specified_videos(self, video_url_list: List[str]):
         """
