@@ -38,6 +38,7 @@ from playwright.async_api import (
     async_playwright,
 )
 from playwright._impl._errors import TargetClosedError
+import httpx
 
 import config
 from base.base_crawler import AbstractCrawler
@@ -478,10 +479,22 @@ class BilibiliCrawler(AbstractCrawler):
                 continue
 
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [self.get_video_info_task(aid=0, bvid=video_id, semaphore=semaphore) for video_id in bvids_list]
-        video_details = await asyncio.gather(*task_list)
+        task_list = []
+        task_ids: List[str] = []
+        for video_id in bvids_list:
+            if video_id.isdigit():
+                task_list.append(self.get_video_info_task(aid=int(video_id), bvid="", semaphore=semaphore))
+            else:
+                task_list.append(self.get_video_info_task(aid=0, bvid=video_id, semaphore=semaphore))
+            task_ids.append(video_id)
+        video_details = await asyncio.gather(*task_list, return_exceptions=True)
         video_aids_list = []
-        for video_detail in video_details:
+        for bvid, video_detail in zip(task_ids, video_details):
+            if isinstance(video_detail, Exception):
+                utils.logger.error(
+                    f"[BilibiliCrawler.get_specified_videos] video_id={bvid} failed: {video_detail}"
+                )
+                continue
             if video_detail is not None:
                 video_item_view: Dict = video_detail.get("View")
                 video_aid: str = video_item_view.get("aid")
@@ -514,6 +527,11 @@ class BilibiliCrawler(AbstractCrawler):
                 return None
             except KeyError as ex:
                 utils.logger.error(f"[BilibiliCrawler.get_video_info_task] have not fund note detail video_id:{bvid}, err: {ex}")
+                return None
+            except (httpx.HTTPError, httpx.ConnectError) as ex:
+                utils.logger.error(
+                    f"[BilibiliCrawler.get_video_info_task] network error video_id:{bvid or aid}, err:{ex}"
+                )
                 return None
 
     async def get_video_play_url_task(self, aid: int, cid: int, semaphore: asyncio.Semaphore) -> Union[Dict, None]:

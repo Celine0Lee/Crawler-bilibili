@@ -26,7 +26,7 @@ MAX_NOTES_PER_DAY = 1
 # - Full URL: "https://www.bilibili.com/video/BV1dwuKzmE26/?spm_id_from=333.1387.homepage.video_card.click"
 # - BV number: "BV1d54y1g7db"
 BILI_SPECIFIED_ID_LIST = [
-    # detail 模式：BV 或完整视频 URL（数据表「高赞案例 / 已知合作稿」可填在此后改 --type detail）
+    # detail 模式：BV 或 av 号（补爬小里森示例见 tools/refill_bili_video_comments.py）
     "BV1Sz4y1U77N",
     "BV14Q4y1n7jz",
 ]

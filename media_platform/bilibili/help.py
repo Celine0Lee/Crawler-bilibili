@@ -92,14 +92,23 @@ def parse_video_info_from_url(url: str) -> VideoUrlInfo:
     if url.startswith("BV"):
         return VideoUrlInfo(video_id=url)
 
-    # Use regex to extract BV number
-    # Match /video/BV... or /video/av... format
-    bv_pattern = r'/video/(BV[a-zA-Z0-9]+)'
-    match = re.search(bv_pattern, url)
+    # av12345678901234 or aid numeric string
+    av_direct = re.match(r"^av(\d+)$", url.strip(), re.IGNORECASE)
+    if av_direct:
+        return VideoUrlInfo(video_id=av_direct.group(1))
+    if url.strip().isdigit():
+        return VideoUrlInfo(video_id=url.strip())
 
+    # Use regex to extract BV or av from URL
+    bv_pattern = r"/video/(BV[a-zA-Z0-9]+)"
+    match = re.search(bv_pattern, url)
     if match:
-        video_id = match.group(1)
-        return VideoUrlInfo(video_id=video_id)
+        return VideoUrlInfo(video_id=match.group(1))
+
+    av_pattern = r"/video/av(\d+)"
+    av_match = re.search(av_pattern, url, re.IGNORECASE)
+    if av_match:
+        return VideoUrlInfo(video_id=av_match.group(1))
 
     raise ValueError(f"Unable to parse video ID from URL: {url}")
 
