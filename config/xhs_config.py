@@ -35,3 +35,19 @@ XHS_CREATOR_ID_LIST = [
     "https://www.xiaohongshu.com/user/profile/5f58bd990000000001003753?xsec_token=ABYVg1evluJZZzpMX-VWzchxQ1qSNVW3r-jOEnKqMcgZw=&xsec_source=pc_search"
     # ........................
 ]
+
+# creator mode: only keep notes published within the last N days
+XHS_CREATOR_NOTE_LOOKBACK_DAYS = 365
+
+# creator mode: keep the top N notes sorted by likes for each creator
+XHS_CREATOR_TOP_LIKED_COUNT = 5
+
+# creator mode: "video" | "normal" | "all"
+XHS_CREATOR_NOTE_TYPE = "video"
+
+# creator mode: crawl all posts within the lookback window, then rank them by likes.
+XHS_CREATOR_FETCH_ALL_WITHIN_LOOKBACK = True
+
+# Safety cap for creator mode to avoid excessive requests on high-volume accounts.
+XHS_CREATOR_MAX_CRAWL_COUNT = 300
+

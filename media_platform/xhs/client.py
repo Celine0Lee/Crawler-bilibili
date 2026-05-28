@@ -19,6 +19,7 @@
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
 
@@ -424,9 +425,10 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
 
         """
         result = []
+        unlimited = max_count <= 0
         comments_has_more = True
         comments_cursor = ""
-        while comments_has_more and len(result) < max_count:
+        while comments_has_more and (unlimited or len(result) < max_count):
             comments_res = await self.get_note_comments(
                 note_id=note_id, xsec_token=xsec_token, cursor=comments_cursor
             )
@@ -438,7 +440,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 )
                 break
             comments = comments_res["comments"]
-            if len(result) + len(comments) > max_count:
+            if not unlimited and len(result) + len(comments) > max_count:
                 comments = comments[: max_count - len(result)]
             if callback:
                 await callback(note_id, comments)
@@ -599,6 +601,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         callback: Optional[Callable] = None,
         xsec_token: str = "",
         xsec_source: str = "pc_feed",
+        lookback_days: Optional[int] = None,
+        max_notes: Optional[int] = None,
     ) -> List[Dict]:
         """
         Get all posts published by specified user, this method will continuously find all post information under a user
@@ -615,7 +619,12 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         result = []
         notes_has_more = True
         notes_cursor = ""
-        while notes_has_more and len(result) < config.CRAWLER_MAX_NOTES_COUNT:
+        max_notes = int(max_notes or config.CRAWLER_MAX_NOTES_COUNT or 0)
+        cutoff_ts = None
+        if lookback_days:
+            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+
+        while notes_has_more and (max_notes <= 0 or len(result) < max_notes):
             notes_res = await self.get_notes_by_creator(
                 user_id, notes_cursor, xsec_token=xsec_token, xsec_source=xsec_source
             )
@@ -638,21 +647,56 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 f"[XiaoHongShuClient.get_all_notes_by_creator] got user_id:{user_id} notes len : {len(notes)}"
             )
 
-            remaining = config.CRAWLER_MAX_NOTES_COUNT - len(result)
-            if remaining <= 0:
+            stop_after_current_page = False
+            if cutoff_ts is not None:
+                filtered_notes = []
+                for note in notes:
+                    note_ts = self._extract_note_timestamp(note)
+                    if note_ts == 0:
+                        filtered_notes.append(note)
+                        continue
+                    if note_ts >= cutoff_ts:
+                        filtered_notes.append(note)
+                    else:
+                        stop_after_current_page = True
+                notes = filtered_notes
+
+            remaining = max_notes - len(result) if max_notes > 0 else len(notes)
+            if max_notes > 0 and remaining <= 0:
                 break
 
-            notes_to_add = notes[:remaining]
+            notes_to_add = notes[:remaining] if max_notes > 0 else notes
             if callback:
                 await callback(notes_to_add)
 
             result.extend(notes_to_add)
+            if stop_after_current_page:
+                utils.logger.info(
+                    f"[XiaoHongShuClient.get_all_notes_by_creator] Reached lookback cutoff for user {user_id}"
+                )
+                break
             await asyncio.sleep(crawl_interval)
 
         utils.logger.info(
             f"[XiaoHongShuClient.get_all_notes_by_creator] Finished getting notes for user {user_id}, total: {len(result)}"
         )
         return result
+
+    @staticmethod
+    def _safe_int(value: Optional[object]) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _extract_note_timestamp(cls, note: Dict) -> int:
+        """Best-effort extraction of a note publish/update timestamp from creator list items."""
+        for key in ("time", "create_time", "publish_time", "last_update_time"):
+            ts = cls._safe_int(note.get(key))
+            if ts > 0:
+                return ts
+        return 0
 
     async def get_note_short_url(self, note_id: str) -> Dict:
         """

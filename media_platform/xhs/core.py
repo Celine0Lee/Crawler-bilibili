@@ -21,6 +21,7 @@ import asyncio
 import os
 import random
 from asyncio import Task
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from playwright.async_api import (
@@ -209,21 +210,79 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
+            fetch_all_within_lookback = bool(getattr(config, "XHS_CREATOR_FETCH_ALL_WITHIN_LOOKBACK", True))
+            lookback_days = int(getattr(config, "XHS_CREATOR_NOTE_LOOKBACK_DAYS", 365) or 365)
+            max_crawl_count = int(
+                getattr(
+                    config,
+                    "XHS_CREATOR_MAX_CRAWL_COUNT",
+                    getattr(config, "CRAWLER_MAX_NOTES_COUNT", 0),
+                ) or 0
+            )
             # Get all note information of the creator
             all_notes_list = await self.xhs_client.get_all_notes_by_creator(
                 user_id=user_id,
                 crawl_interval=crawl_interval,
-                callback=self.fetch_creator_notes_detail,
                 xsec_token=creator_info.xsec_token,
                 xsec_source=creator_info.xsec_source,
+                lookback_days=lookback_days if fetch_all_within_lookback else None,
+                max_notes=max_crawl_count,
             )
+
+            selected_notes = self.filter_creator_notes(all_notes_list)
+            if not selected_notes:
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.get_creators_and_notes] No notes matched filters for user {user_id}"
+                )
+                continue
+
+            await self.fetch_creator_notes_detail(selected_notes)
 
             note_ids = []
             xsec_tokens = []
-            for note_item in all_notes_list:
+            for note_item in selected_notes:
                 note_ids.append(note_item.get("note_id"))
                 xsec_tokens.append(note_item.get("xsec_token"))
             await self.batch_get_note_comments(note_ids, xsec_tokens)
+
+    def filter_creator_notes(self, note_list: List[Dict]) -> List[Dict]:
+        """Filter creator notes by type, publish time and likes."""
+        note_type = str(getattr(config, "XHS_CREATOR_NOTE_TYPE", "video") or "video").lower()
+        lookback_days = int(getattr(config, "XHS_CREATOR_NOTE_LOOKBACK_DAYS", 365) or 365)
+        top_count = int(getattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5) or 5)
+        cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+
+        filtered_notes: List[Dict] = []
+        for note_item in note_list:
+            if note_type != "all" and note_item.get("type") != note_type:
+                continue
+
+            publish_ts = self._safe_int(note_item.get("time"))
+            if publish_ts and publish_ts < cutoff_ts:
+                continue
+
+            filtered_notes.append(note_item)
+
+        filtered_notes.sort(
+            key=lambda item: (
+                self._safe_int(item.get("interact_info", {}).get("liked_count")),
+                self._safe_int(item.get("time")),
+            ),
+            reverse=True,
+        )
+        selected_notes = filtered_notes[:top_count]
+        utils.logger.info(
+            "[XiaoHongShuCrawler.filter_creator_notes] "
+            f"Selected {len(selected_notes)}/{len(note_list)} notes after filtering"
+        )
+        return selected_notes
+
+    @staticmethod
+    def _safe_int(value: Optional[object]) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
     async def fetch_creator_notes_detail(self, note_list: List[Dict]):
         """Concurrently obtain the specified post list and save the data"""

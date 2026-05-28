@@ -18,7 +18,7 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 # Basic configuration
-PLATFORM = "bili"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
+PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 
 # 是否使用海外版小红书 (rednote.com)
 # 开启后 API 走 webapi.rednote.com，cookie 域使用 .rednote.com
@@ -26,7 +26,7 @@ XHS_INTERNATIONAL = False
 
 # search 模式：数据表（3）同类品牌合作 +（5）负面舆情 — 英文逗号分隔，可增删后配合 --type search
 KEYWORDS = "品牌合作,种草,测评,赞助,软广,硬广,恰饭,割韭菜,不真实"
-LOGIN_TYPE = "qrcode"  # qrcode or phone or cookie
+LOGIN_TYPE = "cookie"  # qrcode or phone or cookie
 COOKIES = ""
 CRAWLER_TYPE = (
     "creator"  # search | detail（BILI_SPECIFIED_ID_LIST）| creator（BILI_CREATOR_ID_LIST，当前小尾巴哦 UID）
@@ -44,7 +44,7 @@ IP_PROXY_PROVIDER_NAME = "kuaidaili"  # kuaidaili | wandouhttp
 # Setting False will open a browser
 # If Xiaohongshu keeps scanning the code to log in but fails, open the browser and manually pass the sliding verification code.
 # If Douyin keeps prompting failure, open the browser and see if mobile phone number verification appears after scanning the QR code to log in. If it does, manually go through it and try again.
-HEADLESS = False
+HEADLESS = True
 
 # Whether to save login status
 SAVE_LOGIN_STATE = True
