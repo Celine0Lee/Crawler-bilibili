@@ -22,6 +22,7 @@ import os
 import random
 from asyncio import Task
 from contextlib import suppress
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from playwright.async_api import (
@@ -210,7 +211,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
-            selected_note_details = await self.collect_creator_latest_notes(
+            selected_note_details = await self.collect_creator_top_liked_recent_videos(
                 user_id=user_id,
                 crawl_interval=crawl_interval,
                 xsec_token=creator_info.xsec_token,
@@ -229,21 +230,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 xsec_tokens.append(note_detail.get("xsec_token"))
             await self.batch_get_note_comments(note_ids, xsec_tokens)
 
-    async def collect_creator_latest_notes(
+    async def collect_creator_top_liked_recent_videos(
         self,
         user_id: str,
         crawl_interval: float,
         xsec_token: str = "",
         xsec_source: str = "pc_feed",
     ) -> List[Dict]:
-        """Collect the latest N creator notes that match the configured note type."""
-        target_count = int(
-            getattr(
-                config,
-                "XHS_CREATOR_LATEST_COUNT",
-                getattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5),
-            ) or 5
-        )
+        """Collect recent creator videos, then keep the top-liked subset."""
+        lookback_days = int(getattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365) or 365)
+        candidate_count = int(getattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20) or 20)
+        top_count = int(getattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5) or 5)
         max_crawl_count = int(
             getattr(
                 config,
@@ -251,17 +248,19 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 getattr(config, "CRAWLER_MAX_NOTES_COUNT", 0),
             ) or 0
         )
-        if target_count <= 0:
+        if lookback_days <= 0 or candidate_count <= 0 or top_count <= 0:
             return []
 
-        selected_note_details: List[Dict] = []
+        cutoff_ms = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+        candidate_note_details: List[Dict] = []
         scanned_note_count = 0
         notes_cursor = ""
         notes_has_more = True
         page_number = 1
         detail_semaphore = asyncio.Semaphore(1)
+        reached_lookback_boundary = False
 
-        while notes_has_more and len(selected_note_details) < target_count:
+        while notes_has_more and len(candidate_note_details) < candidate_count:
             if max_crawl_count > 0 and scanned_note_count >= max_crawl_count:
                 break
 
@@ -295,7 +294,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 notes = notes[:remaining_scan_count]
 
             utils.logger.info(
-                "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
                 f"Scanning creator page {page_number} with {len(notes)} notes for user {user_id}"
             )
             for post_item in notes:
@@ -312,33 +311,72 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 if not note_detail or not self._creator_note_matches_type(note_detail):
                     continue
 
-                selected_note_details.append(note_detail)
-                utils.logger.info(
-                    "[XiaoHongShuCrawler.collect_creator_latest_notes] "
-                    f"Selected latest note {len(selected_note_details)}/{target_count}: "
-                    f"{note_detail.get('note_id')}"
-                )
-                await xhs_store.update_xhs_note(note_detail)
-                await self.get_notice_media(note_detail)
-                if len(selected_note_details) >= target_count:
+                publish_time_ms = self._get_note_publish_time_ms(note_detail)
+                if not publish_time_ms:
+                    utils.logger.warning(
+                        "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
+                        f"Skip note {note_detail.get('note_id')} because publish time is missing"
+                    )
+                    continue
+                if publish_time_ms and publish_time_ms < cutoff_ms:
+                    reached_lookback_boundary = True
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
+                        f"Stop scanning user {user_id}: note {note_detail.get('note_id')} "
+                        f"is older than {lookback_days} days"
+                    )
                     break
 
-            if len(selected_note_details) >= target_count:
+                candidate_note_details.append(note_detail)
+                utils.logger.info(
+                    "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
+                    f"Collected candidate video {len(candidate_note_details)}/{candidate_count}: "
+                    f"{note_detail.get('note_id')}"
+                )
+                if len(candidate_note_details) >= candidate_count:
+                    break
+
+            if len(candidate_note_details) >= candidate_count or reached_lookback_boundary:
                 break
 
             if notes_has_more and crawl_interval > 0:
                 await asyncio.sleep(crawl_interval)
                 utils.logger.info(
-                    "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                    "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
                     f"Sleeping for {crawl_interval} seconds before creator page {page_number + 1}"
                 )
             page_number += 1
 
+        selected_note_details = sorted(
+            candidate_note_details,
+            key=self._get_note_liked_count,
+            reverse=True,
+        )[:top_count]
+        for note_detail in selected_note_details:
+            await xhs_store.update_xhs_note(note_detail)
+            await self.get_notice_media(note_detail)
+
         utils.logger.info(
-            "[XiaoHongShuCrawler.collect_creator_latest_notes] "
-            f"Selected {len(selected_note_details)} notes after scanning {scanned_note_count} creator notes"
+            "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
+            f"Collected {len(candidate_note_details)} candidate videos and selected "
+            f"{len(selected_note_details)} top-liked videos after scanning {scanned_note_count} creator notes"
         )
         return selected_note_details
+
+    async def collect_creator_latest_notes(
+        self,
+        user_id: str,
+        crawl_interval: float,
+        xsec_token: str = "",
+        xsec_source: str = "pc_feed",
+    ) -> List[Dict]:
+        """Backward-compatible wrapper for creator-mode video selection."""
+        return await self.collect_creator_top_liked_recent_videos(
+            user_id=user_id,
+            crawl_interval=crawl_interval,
+            xsec_token=xsec_token,
+            xsec_source=xsec_source,
+        )
 
     def _creator_note_summary_matches_type(self, note_item: Dict) -> bool:
         note_type = str(getattr(config, "XHS_CREATOR_NOTE_TYPE", "video") or "video").lower()
@@ -355,6 +393,41 @@ class XiaoHongShuCrawler(AbstractCrawler):
         if note_type == "all":
             return True
         return str(note_detail.get("type") or "").lower() == note_type
+
+    @staticmethod
+    def _get_note_publish_time_ms(note_detail: Dict) -> int:
+        publish_time = note_detail.get("time") or note_detail.get("last_update_time") or 0
+        try:
+            publish_time_ms = int(publish_time)
+        except (TypeError, ValueError):
+            return 0
+        if publish_time_ms and publish_time_ms < 10_000_000_000:
+            publish_time_ms *= 1000
+        return publish_time_ms
+
+    @staticmethod
+    def _get_note_liked_count(note_detail: Dict) -> int:
+        interact_info = note_detail.get("interact_info") or {}
+        liked_count = interact_info.get("liked_count", note_detail.get("liked_count", 0))
+        if isinstance(liked_count, (int, float)):
+            return int(liked_count)
+
+        liked_count_str = str(liked_count or "0").strip().replace(",", "")
+        multiplier = 1
+        if liked_count_str.endswith("万"):
+            multiplier = 10_000
+            liked_count_str = liked_count_str[:-1]
+        elif liked_count_str.endswith("亿"):
+            multiplier = 100_000_000
+            liked_count_str = liked_count_str[:-1]
+        elif liked_count_str.lower().endswith("k"):
+            multiplier = 1_000
+            liked_count_str = liked_count_str[:-1]
+
+        try:
+            return int(float(liked_count_str) * multiplier)
+        except (TypeError, ValueError):
+            return 0
 
     async def get_specified_notes(self):
         """Get the information and comments of the specified post

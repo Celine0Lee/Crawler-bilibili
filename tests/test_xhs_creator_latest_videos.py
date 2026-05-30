@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for Xiaohongshu creator-mode latest-video selection."""
+"""Unit tests for Xiaohongshu creator-mode top-liked recent-video selection."""
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,20 +12,18 @@ from media_platform.xhs.core import XiaoHongShuCrawler
 
 
 @pytest.mark.asyncio
-async def test_collect_creator_latest_notes_stops_after_five_videos(monkeypatch):
-    monkeypatch.setattr(config, "XHS_CREATOR_LATEST_COUNT", 5, raising=False)
+async def test_collect_creator_top_liked_recent_videos_picks_top_five_from_twenty(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
     monkeypatch.setattr(config, "XHS_CREATOR_MAX_CRAWL_COUNT", 30)
     monkeypatch.setattr("media_platform.xhs.core.asyncio.sleep", AsyncMock())
 
     note_summaries = [
-        {"note_id": "n1", "xsec_source": "pc_feed", "xsec_token": "t1"},
-        {"note_id": "n2", "xsec_source": "pc_feed", "xsec_token": "t2"},
-        {"note_id": "n3", "xsec_source": "pc_feed", "xsec_token": "t3"},
-        {"note_id": "n4", "xsec_source": "pc_feed", "xsec_token": "t4"},
-        {"note_id": "n5", "xsec_source": "pc_feed", "xsec_token": "t5"},
-        {"note_id": "n6", "xsec_source": "pc_feed", "xsec_token": "t6"},
-        {"note_id": "n7", "xsec_source": "pc_feed", "xsec_token": "t7"},
+        {"note_id": f"n{i}", "xsec_source": "pc_feed", "xsec_token": f"t{i}"}
+        for i in range(1, 23)
     ]
     page_calls = []
 
@@ -33,19 +32,18 @@ async def test_collect_creator_latest_notes_stops_after_five_videos(monkeypatch)
         return {"has_more": True, "cursor": "next-page", "notes": note_summaries}
 
     detail_calls = []
-    note_types = {
-        "n1": "video",
-        "n2": "normal",
-        "n3": "video",
-        "n4": "video",
-        "n5": "video",
-        "n6": "video",
-        "n7": "video",
-    }
+    likes = {f"n{i}": i for i in range(1, 23)}
+    likes.update({"n3": 900, "n7": 700, "n11": 1100, "n17": 1700, "n20": 1200})
 
     async def fake_get_note_detail_async_task(note_id, xsec_source, xsec_token, semaphore):
         detail_calls.append(note_id)
-        return {"note_id": note_id, "type": note_types[note_id], "xsec_token": xsec_token}
+        return {
+            "note_id": note_id,
+            "type": "video",
+            "time": now_ms - 86_400_000,
+            "xsec_token": xsec_token,
+            "interact_info": {"liked_count": likes[note_id]},
+        }
 
     crawler = XiaoHongShuCrawler()
     crawler.xhs_client = MagicMock()
@@ -54,7 +52,7 @@ async def test_collect_creator_latest_notes_stops_after_five_videos(monkeypatch)
     monkeypatch.setattr("store.xhs.update_xhs_note", AsyncMock())
     monkeypatch.setattr(crawler, "get_notice_media", AsyncMock())
 
-    selected = await crawler.collect_creator_latest_notes(
+    selected = await crawler.collect_creator_top_liked_recent_videos(
         user_id="creator_123",
         crawl_interval=0,
         xsec_token="creator-token",
@@ -62,13 +60,17 @@ async def test_collect_creator_latest_notes_stops_after_five_videos(monkeypatch)
     )
 
     assert page_calls == [("creator_123", "")]
-    assert detail_calls == ["n1", "n2", "n3", "n4", "n5", "n6"]
-    assert [note["note_id"] for note in selected] == ["n1", "n3", "n4", "n5", "n6"]
+    assert detail_calls == [f"n{i}" for i in range(1, 21)]
+    assert [note["note_id"] for note in selected] == ["n17", "n20", "n11", "n3", "n7"]
 
 
 @pytest.mark.asyncio
-async def test_collect_creator_latest_notes_skips_non_video_summaries_before_detail(monkeypatch):
-    monkeypatch.setattr(config, "XHS_CREATOR_LATEST_COUNT", 5, raising=False)
+async def test_collect_creator_top_liked_recent_videos_stops_when_note_is_older_than_window(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    old_ms = now_ms - 366 * 86_400_000
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
     monkeypatch.setattr(config, "XHS_CREATOR_MAX_CRAWL_COUNT", 30)
     monkeypatch.setattr("media_platform.xhs.core.asyncio.sleep", AsyncMock())
@@ -79,7 +81,8 @@ async def test_collect_creator_latest_notes_skips_non_video_summaries_before_det
         {"note_id": "n3", "type": "video", "xsec_source": "pc_feed", "xsec_token": "t3"},
         {"note_id": "n4", "type": "video", "xsec_source": "pc_feed", "xsec_token": "t4"},
         {"note_id": "n5", "type": "video", "xsec_source": "pc_feed", "xsec_token": "t5"},
-        {"note_id": "n6", "type": "video", "xsec_source": "pc_feed", "xsec_token": "t6"},
+        {"note_id": "old", "type": "video", "xsec_source": "pc_feed", "xsec_token": "t-old"},
+        {"note_id": "after-old", "type": "video", "xsec_source": "pc_feed", "xsec_token": "t-after"},
     ]
 
     async def fake_get_notes_by_creator(creator, cursor, page_size=30, xsec_token="", xsec_source="pc_feed"):
@@ -89,7 +92,13 @@ async def test_collect_creator_latest_notes_skips_non_video_summaries_before_det
 
     async def fake_get_note_detail_async_task(note_id, xsec_source, xsec_token, semaphore):
         detail_calls.append(note_id)
-        return {"note_id": note_id, "type": "video", "xsec_token": xsec_token}
+        return {
+            "note_id": note_id,
+            "type": "video",
+            "time": old_ms if note_id == "old" else now_ms - 86_400_000,
+            "xsec_token": xsec_token,
+            "interact_info": {"liked_count": {"n1": 10, "n3": 30, "n4": 20, "n5": 50}.get(note_id, 1)},
+        }
 
     crawler = XiaoHongShuCrawler()
     crawler.xhs_client = MagicMock()
@@ -98,20 +107,23 @@ async def test_collect_creator_latest_notes_skips_non_video_summaries_before_det
     monkeypatch.setattr("store.xhs.update_xhs_note", AsyncMock())
     monkeypatch.setattr(crawler, "get_notice_media", AsyncMock())
 
-    selected = await crawler.collect_creator_latest_notes(
+    selected = await crawler.collect_creator_top_liked_recent_videos(
         user_id="creator_skip_summary",
         crawl_interval=0,
         xsec_token="creator-token",
         xsec_source="pc_feed",
     )
 
-    assert detail_calls == ["n1", "n3", "n4", "n5", "n6"]
-    assert [note["note_id"] for note in selected] == ["n1", "n3", "n4", "n5", "n6"]
+    assert detail_calls == ["n1", "n3", "n4", "n5", "old"]
+    assert [note["note_id"] for note in selected] == ["n5", "n3", "n4", "n1"]
 
 
 @pytest.mark.asyncio
-async def test_collect_creator_latest_notes_turns_page_when_first_page_not_enough(monkeypatch):
-    monkeypatch.setattr(config, "XHS_CREATOR_LATEST_COUNT", 5, raising=False)
+async def test_collect_creator_top_liked_recent_videos_turns_page_until_twenty_candidates(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
     monkeypatch.setattr(config, "XHS_CREATOR_MAX_CRAWL_COUNT", 30)
     sleep_mock = AsyncMock()
@@ -121,18 +133,16 @@ async def test_collect_creator_latest_notes_turns_page_when_first_page_not_enoug
         "has_more": True,
         "cursor": "page-2",
         "notes": [
-            {"note_id": "n1", "xsec_source": "pc_feed", "xsec_token": "t1"},
-            {"note_id": "n2", "xsec_source": "pc_feed", "xsec_token": "t2"},
+            {"note_id": f"n{i}", "xsec_source": "pc_feed", "xsec_token": f"t{i}"}
+            for i in range(1, 11)
         ],
     }
     page2 = {
         "has_more": False,
         "cursor": "",
         "notes": [
-            {"note_id": "n3", "xsec_source": "pc_feed", "xsec_token": "t3"},
-            {"note_id": "n4", "xsec_source": "pc_feed", "xsec_token": "t4"},
-            {"note_id": "n5", "xsec_source": "pc_feed", "xsec_token": "t5"},
-            {"note_id": "n6", "xsec_source": "pc_feed", "xsec_token": "t6"},
+            {"note_id": f"n{i}", "xsec_source": "pc_feed", "xsec_token": f"t{i}"}
+            for i in range(11, 23)
         ],
     }
 
@@ -143,17 +153,15 @@ async def test_collect_creator_latest_notes_turns_page_when_first_page_not_enoug
             return page2
         return {"has_more": False, "cursor": "", "notes": []}
 
-    note_types = {
-        "n1": "video",
-        "n2": "normal",
-        "n3": "video",
-        "n4": "video",
-        "n5": "video",
-        "n6": "video",
-    }
-
     async def fake_get_note_detail_async_task(note_id, xsec_source, xsec_token, semaphore):
-        return {"note_id": note_id, "type": note_types[note_id], "xsec_token": xsec_token}
+        note_number = int(note_id[1:])
+        return {
+            "note_id": note_id,
+            "type": "video",
+            "time": now_ms - 86_400_000,
+            "xsec_token": xsec_token,
+            "interact_info": {"liked_count": note_number},
+        }
 
     crawler = XiaoHongShuCrawler()
     crawler.xhs_client = MagicMock()
@@ -162,7 +170,7 @@ async def test_collect_creator_latest_notes_turns_page_when_first_page_not_enoug
     monkeypatch.setattr("store.xhs.update_xhs_note", AsyncMock())
     monkeypatch.setattr(crawler, "get_notice_media", AsyncMock())
 
-    selected = await crawler.collect_creator_latest_notes(
+    selected = await crawler.collect_creator_top_liked_recent_videos(
         user_id="creator_456",
         crawl_interval=3,
         xsec_token="creator-token",
@@ -171,7 +179,8 @@ async def test_collect_creator_latest_notes_turns_page_when_first_page_not_enoug
 
     assert crawler.xhs_client.get_notes_by_creator.await_count == 2
     assert sleep_mock.await_count == 1
-    assert [note["note_id"] for note in selected] == ["n1", "n3", "n4", "n5", "n6"]
+    assert crawler.get_note_detail_async_task.await_count == 20
+    assert [note["note_id"] for note in selected] == ["n20", "n19", "n18", "n17", "n16"]
 
 
 @pytest.mark.asyncio

@@ -36,8 +36,14 @@ XHS_CREATOR_ID_LIST = [
     # ........................
 ]
 
-# creator mode: keep the latest N notes for each creator
-XHS_CREATOR_LATEST_COUNT = 5
+# creator mode: scan videos published within the latest N days
+XHS_CREATOR_VIDEO_LOOKBACK_DAYS = 365
+
+# creator mode: collect up to N recent videos as candidates before ranking
+XHS_CREATOR_CANDIDATE_VIDEO_COUNT = 20
+
+# creator mode: keep the top N liked videos from the candidate set
+XHS_CREATOR_TOP_LIKED_COUNT = 5
 
 # creator mode: "video" | "normal" | "all"
 XHS_CREATOR_NOTE_TYPE = "video"
