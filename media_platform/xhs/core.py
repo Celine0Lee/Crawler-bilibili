@@ -238,8 +238,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
         xsec_source: str = "pc_feed",
     ) -> List[Dict]:
         """Collect recent creator videos, then keep the top-liked subset."""
-        lookback_days = int(getattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365) or 365)
+        lookback_days = int(getattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 0) or 0)
         candidate_count = int(getattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20) or 20)
+        pinned_head_count = int(getattr(config, "XHS_CREATOR_PINNED_NOTE_HEAD_COUNT", 2) or 0)
         top_count = int(getattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5) or 5)
         max_crawl_count = int(
             getattr(
@@ -248,11 +249,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 getattr(config, "CRAWLER_MAX_NOTES_COUNT", 0),
             ) or 0
         )
-        if lookback_days <= 0 or candidate_count <= 0 or top_count <= 0:
+        if candidate_count <= 0 or top_count <= 0:
             return []
 
-        cutoff_ms = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
-        candidate_note_details: List[Dict] = []
+        cutoff_ms = (
+            int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+            if lookback_days > 0
+            else 0
+        )
+        recent_note_details: List[Dict] = []
+        seen_note_ids: set[str] = set()
         scanned_note_count = 0
         notes_cursor = ""
         notes_has_more = True
@@ -260,7 +266,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         detail_semaphore = asyncio.Semaphore(1)
         reached_lookback_boundary = False
 
-        while notes_has_more and len(candidate_note_details) < candidate_count:
+        while notes_has_more:
             if max_crawl_count > 0 and scanned_note_count >= max_crawl_count:
                 break
 
@@ -299,6 +305,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             )
             for post_item in notes:
                 scanned_note_count += 1
+                is_possible_pinned_note = scanned_note_count <= pinned_head_count
                 if not self._creator_note_summary_matches_type(post_item):
                     continue
 
@@ -311,6 +318,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 if not note_detail or not self._creator_note_matches_type(note_detail):
                     continue
 
+                note_id = note_detail.get("note_id")
+                if note_id and note_id in seen_note_ids:
+                    continue
+
                 publish_time_ms = self._get_note_publish_time_ms(note_detail)
                 if not publish_time_ms:
                     utils.logger.warning(
@@ -318,25 +329,51 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         f"Skip note {note_detail.get('note_id')} because publish time is missing"
                     )
                     continue
-                if publish_time_ms and publish_time_ms < cutoff_ms:
+                if cutoff_ms and publish_time_ms < cutoff_ms:
+                    if is_possible_pinned_note:
+                        utils.logger.info(
+                            "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
+                            f"Skip possible pinned note {note_id} because it is older than {lookback_days} days"
+                        )
+                        continue
                     reached_lookback_boundary = True
                     utils.logger.info(
                         "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
-                        f"Stop scanning user {user_id}: note {note_detail.get('note_id')} "
+                        f"Stop scanning user {user_id}: note {note_id} "
                         f"is older than {lookback_days} days"
                     )
                     break
 
-                candidate_note_details.append(note_detail)
+                if note_id:
+                    seen_note_ids.add(note_id)
+                recent_note_details.append(note_detail)
                 utils.logger.info(
                     "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
-                    f"Collected candidate video {len(candidate_note_details)}/{candidate_count}: "
-                    f"{note_detail.get('note_id')}"
+                    f"Collected recent video {len(recent_note_details)} before chronological trim: {note_id}"
                 )
-                if len(candidate_note_details) >= candidate_count:
+
+                chronological_candidates = self._select_latest_notes_by_publish_time(
+                    recent_note_details,
+                    candidate_count,
+                )
+                if (
+                    len(chronological_candidates) >= candidate_count
+                    and not is_possible_pinned_note
+                    and publish_time_ms <= self._get_note_publish_time_ms(chronological_candidates[-1])
+                ):
                     break
 
-            if len(candidate_note_details) >= candidate_count or reached_lookback_boundary:
+            chronological_candidates = self._select_latest_notes_by_publish_time(
+                recent_note_details,
+                candidate_count,
+            )
+            if (
+                reached_lookback_boundary
+                or (
+                    len(chronological_candidates) >= candidate_count
+                    and scanned_note_count > pinned_head_count
+                )
+            ):
                 break
 
             if notes_has_more and crawl_interval > 0:
@@ -347,6 +384,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 )
             page_number += 1
 
+        candidate_note_details = self._select_latest_notes_by_publish_time(
+            recent_note_details,
+            candidate_count,
+        )
         selected_note_details = sorted(
             candidate_note_details,
             key=self._get_note_liked_count,
@@ -358,7 +399,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
         utils.logger.info(
             "[XiaoHongShuCrawler.collect_creator_top_liked_recent_videos] "
-            f"Collected {len(candidate_note_details)} candidate videos and selected "
+            f"Collected {len(recent_note_details)} recent videos, kept {len(candidate_note_details)} "
+            f"latest candidates, and selected "
             f"{len(selected_note_details)} top-liked videos after scanning {scanned_note_count} creator notes"
         )
         return selected_note_details
@@ -428,6 +470,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return int(float(liked_count_str) * multiplier)
         except (TypeError, ValueError):
             return 0
+
+    def _select_latest_notes_by_publish_time(self, note_details: List[Dict], limit: int) -> List[Dict]:
+        return sorted(
+            note_details,
+            key=self._get_note_publish_time_ms,
+            reverse=True,
+        )[:limit]
 
     async def get_specified_notes(self):
         """Get the information and comments of the specified post

@@ -36,11 +36,14 @@ XHS_CREATOR_ID_LIST = [
     # ........................
 ]
 
-# creator mode: scan videos published within the latest N days
-XHS_CREATOR_VIDEO_LOOKBACK_DAYS = 365
+# creator mode: scan videos by publish time. 0 means no lookback limit.
+XHS_CREATOR_VIDEO_LOOKBACK_DAYS = 0
 
 # creator mode: collect up to N recent videos as candidates before ranking
 XHS_CREATOR_CANDIDATE_VIDEO_COUNT = 20
+
+# creator mode: Xiaohongshu may put pinned notes before the chronological feed
+XHS_CREATOR_PINNED_NOTE_HEAD_COUNT = 2
 
 # creator mode: keep the top N liked videos from the candidate set
 XHS_CREATOR_TOP_LIKED_COUNT = 5

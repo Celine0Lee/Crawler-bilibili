@@ -14,7 +14,7 @@ from media_platform.xhs.core import XiaoHongShuCrawler
 @pytest.mark.asyncio
 async def test_collect_creator_top_liked_recent_videos_picks_top_five_from_twenty(monkeypatch):
     now_ms = int(time.time() * 1000)
-    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 0, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
@@ -65,10 +65,10 @@ async def test_collect_creator_top_liked_recent_videos_picks_top_five_from_twent
 
 
 @pytest.mark.asyncio
-async def test_collect_creator_top_liked_recent_videos_stops_when_note_is_older_than_window(monkeypatch):
+async def test_collect_creator_top_liked_recent_videos_does_not_stop_at_old_video_when_lookback_disabled(monkeypatch):
     now_ms = int(time.time() * 1000)
     old_ms = now_ms - 366 * 86_400_000
-    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 0, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
@@ -114,14 +114,14 @@ async def test_collect_creator_top_liked_recent_videos_stops_when_note_is_older_
         xsec_source="pc_feed",
     )
 
-    assert detail_calls == ["n1", "n3", "n4", "n5", "old"]
-    assert [note["note_id"] for note in selected] == ["n5", "n3", "n4", "n1"]
+    assert detail_calls == ["n1", "n3", "n4", "n5", "old", "after-old"]
+    assert [note["note_id"] for note in selected] == ["n5", "n3", "n4", "n1", "after-old"]
 
 
 @pytest.mark.asyncio
 async def test_collect_creator_top_liked_recent_videos_turns_page_until_twenty_candidates(monkeypatch):
     now_ms = int(time.time() * 1000)
-    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 365, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 0, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
     monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
@@ -181,6 +181,70 @@ async def test_collect_creator_top_liked_recent_videos_turns_page_until_twenty_c
     assert sleep_mock.await_count == 1
     assert crawler.get_note_detail_async_task.await_count == 20
     assert [note["note_id"] for note in selected] == ["n20", "n19", "n18", "n17", "n16"]
+
+
+@pytest.mark.asyncio
+async def test_collect_creator_top_liked_recent_videos_reorders_pinned_notes_by_publish_time(monkeypatch):
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(config, "XHS_CREATOR_VIDEO_LOOKBACK_DAYS", 0, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_CANDIDATE_VIDEO_COUNT", 20, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_PINNED_NOTE_HEAD_COUNT", 2, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5, raising=False)
+    monkeypatch.setattr(config, "XHS_CREATOR_NOTE_TYPE", "video")
+    monkeypatch.setattr(config, "XHS_CREATOR_MAX_CRAWL_COUNT", 40)
+    monkeypatch.setattr("media_platform.xhs.core.asyncio.sleep", AsyncMock())
+
+    note_summaries = [
+        {"note_id": "pinned-old", "type": "video", "xsec_source": "pc_feed", "xsec_token": "tp-old"},
+        {"note_id": "pinned-recent", "type": "video", "xsec_source": "pc_feed", "xsec_token": "tp-recent"},
+    ] + [
+        {"note_id": f"n{i}", "type": "video", "xsec_source": "pc_feed", "xsec_token": f"t{i}"}
+        for i in range(1, 23)
+    ]
+
+    def note_time(note_id: str) -> int:
+        if note_id == "pinned-old":
+            return now_ms - 500 * 86_400_000
+        if note_id == "pinned-recent":
+            return now_ms - 3_500
+        note_number = int(note_id[1:])
+        return now_ms - note_number * 1_000
+
+    likes = {f"n{i}": i for i in range(1, 23)}
+    likes.update({"pinned-old": 99_999, "pinned-recent": 88_888, "n19": 19_000})
+
+    async def fake_get_notes_by_creator(creator, cursor, page_size=30, xsec_token="", xsec_source="pc_feed"):
+        return {"has_more": False, "cursor": "", "notes": note_summaries}
+
+    detail_calls = []
+
+    async def fake_get_note_detail_async_task(note_id, xsec_source, xsec_token, semaphore):
+        detail_calls.append(note_id)
+        return {
+            "note_id": note_id,
+            "type": "video",
+            "time": note_time(note_id),
+            "xsec_token": xsec_token,
+            "interact_info": {"liked_count": likes[note_id]},
+        }
+
+    crawler = XiaoHongShuCrawler()
+    crawler.xhs_client = MagicMock()
+    crawler.xhs_client.get_notes_by_creator = AsyncMock(side_effect=fake_get_notes_by_creator)
+    crawler.get_note_detail_async_task = AsyncMock(side_effect=fake_get_note_detail_async_task)
+    monkeypatch.setattr("store.xhs.update_xhs_note", AsyncMock())
+    monkeypatch.setattr(crawler, "get_notice_media", AsyncMock())
+
+    selected = await crawler.collect_creator_top_liked_recent_videos(
+        user_id="creator_pinned",
+        crawl_interval=0,
+        xsec_token="creator-token",
+        xsec_source="pc_feed",
+    )
+
+    assert detail_calls == ["pinned-old", "pinned-recent"] + [f"n{i}" for i in range(1, 20)]
+    assert "pinned-old" not in [note["note_id"] for note in selected]
+    assert [note["note_id"] for note in selected] == ["pinned-recent", "n19", "n18", "n17", "n16"]
 
 
 @pytest.mark.asyncio
