@@ -426,9 +426,10 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         result = []
         unlimited = max_count <= 0
+        total_count = 0
         comments_has_more = True
         comments_cursor = ""
-        while comments_has_more and (unlimited or len(result) < max_count):
+        while comments_has_more and (unlimited or total_count < max_count):
             comments_res = await self.get_note_comments(
                 note_id=note_id, xsec_token=xsec_token, cursor=comments_cursor
             )
@@ -440,19 +441,27 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 )
                 break
             comments = comments_res["comments"]
-            if not unlimited and len(result) + len(comments) > max_count:
-                comments = comments[: max_count - len(result)]
+            if not unlimited:
+                remaining_count = max_count - total_count
+                if remaining_count <= 0:
+                    break
+                comments = comments[:remaining_count]
             if callback:
                 await callback(note_id, comments)
             await asyncio.sleep(crawl_interval)
             result.extend(comments)
+            total_count += len(comments)
+            if not comments or (not unlimited and total_count >= max_count):
+                break
             sub_comments = await self.get_comments_all_sub_comments(
                 comments=comments,
                 xsec_token=xsec_token,
                 crawl_interval=crawl_interval,
                 callback=callback,
+                max_count=(max_count - total_count) if not unlimited else 0,
             )
             result.extend(sub_comments)
+            total_count += len(sub_comments)
         return result
 
     async def get_comments_all_sub_comments(
@@ -461,6 +470,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         xsec_token: str,
         crawl_interval: float = 1.0,
         callback: Optional[Callable] = None,
+        max_count: int = 0,
     ) -> List[Dict]:
         """
         Get all second-level comments under specified first-level comments, this method will continuously find all second-level comment information under first-level comments
@@ -480,12 +490,24 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             return []
 
         result = []
+        unlimited = max_count <= 0
         for comment in comments:
+            if not unlimited and len(result) >= max_count:
+                break
             try:
                 note_id = comment.get("note_id")
                 sub_comments = comment.get("sub_comments")
-                if sub_comments and callback:
-                    await callback(note_id, sub_comments)
+                if sub_comments:
+                    if not unlimited:
+                        remaining_count = max_count - len(result)
+                        if remaining_count <= 0:
+                            break
+                        sub_comments = sub_comments[:remaining_count]
+                    if callback:
+                        await callback(note_id, sub_comments)
+                    result.extend(sub_comments)
+                    if not unlimited and len(result) >= max_count:
+                        break
 
                 sub_comment_has_more = comment.get("sub_comment_has_more")
                 if not sub_comment_has_more:
@@ -495,6 +517,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 sub_comment_cursor = comment.get("sub_comment_cursor")
 
                 while sub_comment_has_more:
+                    if not unlimited and len(result) >= max_count:
+                        break
                     try:
                         comments_res = await self.get_note_sub_comments(
                             note_id=note_id,
@@ -517,6 +541,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                             )
                             break
                         comments = comments_res["comments"]
+                        if not unlimited:
+                            remaining_count = max_count - len(result)
+                            if remaining_count <= 0:
+                                break
+                            comments = comments[:remaining_count]
                         if callback:
                             await callback(note_id, comments)
                         await asyncio.sleep(crawl_interval)
@@ -601,7 +630,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         callback: Optional[Callable] = None,
         xsec_token: str = "",
         xsec_source: str = "pc_feed",
-        lookback_days: Optional[int] = None,
         max_notes: Optional[int] = None,
     ) -> List[Dict]:
         """
@@ -620,9 +648,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         notes_has_more = True
         notes_cursor = ""
         max_notes = int(max_notes or config.CRAWLER_MAX_NOTES_COUNT or 0)
-        cutoff_ts = None
-        if lookback_days:
-            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
 
         while notes_has_more and (max_notes <= 0 or len(result) < max_notes):
             notes_res = await self.get_notes_by_creator(
@@ -647,20 +672,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 f"[XiaoHongShuClient.get_all_notes_by_creator] got user_id:{user_id} notes len : {len(notes)}"
             )
 
-            stop_after_current_page = False
-            if cutoff_ts is not None:
-                filtered_notes = []
-                for note in notes:
-                    note_ts = self._extract_note_timestamp(note)
-                    if note_ts == 0:
-                        filtered_notes.append(note)
-                        continue
-                    if note_ts >= cutoff_ts:
-                        filtered_notes.append(note)
-                    else:
-                        stop_after_current_page = True
-                notes = filtered_notes
-
             remaining = max_notes - len(result) if max_notes > 0 else len(notes)
             if max_notes > 0 and remaining <= 0:
                 break
@@ -670,11 +681,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 await callback(notes_to_add)
 
             result.extend(notes_to_add)
-            if stop_after_current_page:
-                utils.logger.info(
-                    f"[XiaoHongShuClient.get_all_notes_by_creator] Reached lookback cutoff for user {user_id}"
-                )
-                break
             await asyncio.sleep(crawl_interval)
 
         utils.logger.info(
@@ -688,15 +694,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
-
-    @classmethod
-    def _extract_note_timestamp(cls, note: Dict) -> int:
-        """Best-effort extraction of a note publish/update timestamp from creator list items."""
-        for key in ("time", "create_time", "publish_time", "last_update_time"):
-            ts = cls._safe_int(note.get(key))
-            if ts > 0:
-                return ts
-        return 0
 
     async def get_note_short_url(self, note_id: str) -> Dict:
         """

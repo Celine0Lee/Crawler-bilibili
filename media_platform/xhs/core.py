@@ -21,7 +21,7 @@ import asyncio
 import os
 import random
 from asyncio import Task
-from datetime import datetime, timedelta, timezone
+from contextlib import suppress
 from typing import Dict, List, Optional
 
 from playwright.async_api import (
@@ -210,97 +210,151 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
-            fetch_all_within_lookback = bool(getattr(config, "XHS_CREATOR_FETCH_ALL_WITHIN_LOOKBACK", True))
-            lookback_days = int(getattr(config, "XHS_CREATOR_NOTE_LOOKBACK_DAYS", 365) or 365)
-            max_crawl_count = int(
-                getattr(
-                    config,
-                    "XHS_CREATOR_MAX_CRAWL_COUNT",
-                    getattr(config, "CRAWLER_MAX_NOTES_COUNT", 0),
-                ) or 0
-            )
-            # Get all note information of the creator
-            all_notes_list = await self.xhs_client.get_all_notes_by_creator(
+            selected_note_details = await self.collect_creator_latest_notes(
                 user_id=user_id,
                 crawl_interval=crawl_interval,
                 xsec_token=creator_info.xsec_token,
-                xsec_source=creator_info.xsec_source,
-                lookback_days=lookback_days if fetch_all_within_lookback else None,
-                max_notes=max_crawl_count,
+                xsec_source=creator_info.xsec_source or "pc_feed",
             )
-
-            selected_notes = self.filter_creator_notes(all_notes_list)
-            if not selected_notes:
+            if not selected_note_details:
                 utils.logger.info(
                     f"[XiaoHongShuCrawler.get_creators_and_notes] No notes matched filters for user {user_id}"
                 )
                 continue
 
-            await self.fetch_creator_notes_detail(selected_notes)
-
             note_ids = []
             xsec_tokens = []
-            for note_item in selected_notes:
-                note_ids.append(note_item.get("note_id"))
-                xsec_tokens.append(note_item.get("xsec_token"))
+            for note_detail in selected_note_details:
+                note_ids.append(note_detail.get("note_id"))
+                xsec_tokens.append(note_detail.get("xsec_token"))
             await self.batch_get_note_comments(note_ids, xsec_tokens)
 
-    def filter_creator_notes(self, note_list: List[Dict]) -> List[Dict]:
-        """Filter creator notes by type, publish time and likes."""
-        note_type = str(getattr(config, "XHS_CREATOR_NOTE_TYPE", "video") or "video").lower()
-        lookback_days = int(getattr(config, "XHS_CREATOR_NOTE_LOOKBACK_DAYS", 365) or 365)
-        top_count = int(getattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5) or 5)
-        cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
-
-        filtered_notes: List[Dict] = []
-        for note_item in note_list:
-            if note_type != "all" and note_item.get("type") != note_type:
-                continue
-
-            publish_ts = self._safe_int(note_item.get("time"))
-            if publish_ts and publish_ts < cutoff_ts:
-                continue
-
-            filtered_notes.append(note_item)
-
-        filtered_notes.sort(
-            key=lambda item: (
-                self._safe_int(item.get("interact_info", {}).get("liked_count")),
-                self._safe_int(item.get("time")),
-            ),
-            reverse=True,
+    async def collect_creator_latest_notes(
+        self,
+        user_id: str,
+        crawl_interval: float,
+        xsec_token: str = "",
+        xsec_source: str = "pc_feed",
+    ) -> List[Dict]:
+        """Collect the latest N creator notes that match the configured note type."""
+        target_count = int(
+            getattr(
+                config,
+                "XHS_CREATOR_LATEST_COUNT",
+                getattr(config, "XHS_CREATOR_TOP_LIKED_COUNT", 5),
+            ) or 5
         )
-        selected_notes = filtered_notes[:top_count]
-        utils.logger.info(
-            "[XiaoHongShuCrawler.filter_creator_notes] "
-            f"Selected {len(selected_notes)}/{len(note_list)} notes after filtering"
+        max_crawl_count = int(
+            getattr(
+                config,
+                "XHS_CREATOR_MAX_CRAWL_COUNT",
+                getattr(config, "CRAWLER_MAX_NOTES_COUNT", 0),
+            ) or 0
         )
-        return selected_notes
+        if target_count <= 0:
+            return []
 
-    @staticmethod
-    def _safe_int(value: Optional[object]) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
+        selected_note_details: List[Dict] = []
+        scanned_note_count = 0
+        notes_cursor = ""
+        notes_has_more = True
+        page_number = 1
+        detail_semaphore = asyncio.Semaphore(1)
 
-    async def fetch_creator_notes_detail(self, note_list: List[Dict]):
-        """Concurrently obtain the specified post list and save the data"""
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [
-            self.get_note_detail_async_task(
-                note_id=post_item.get("note_id"),
-                xsec_source=post_item.get("xsec_source"),
-                xsec_token=post_item.get("xsec_token"),
-                semaphore=semaphore,
-            ) for post_item in note_list
-        ]
+        while notes_has_more and len(selected_note_details) < target_count:
+            if max_crawl_count > 0 and scanned_note_count >= max_crawl_count:
+                break
 
-        note_details = await asyncio.gather(*task_list)
-        for note_detail in note_details:
-            if note_detail:
+            notes_res = await self.xhs_client.get_notes_by_creator(
+                creator=user_id,
+                cursor=notes_cursor,
+                xsec_token=xsec_token,
+                xsec_source=xsec_source,
+            )
+            if not notes_res:
+                utils.logger.error(
+                    "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                    f"Empty creator note list for user {user_id}"
+                )
+                break
+
+            notes_has_more = notes_res.get("has_more", False)
+            notes_cursor = notes_res.get("cursor", "")
+            notes = notes_res.get("notes", [])
+            if not notes:
+                utils.logger.info(
+                    "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                    f"No more creator notes on page {page_number} for user {user_id}"
+                )
+                break
+
+            if max_crawl_count > 0:
+                remaining_scan_count = max_crawl_count - scanned_note_count
+                if remaining_scan_count <= 0:
+                    break
+                notes = notes[:remaining_scan_count]
+
+            utils.logger.info(
+                "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                f"Scanning creator page {page_number} with {len(notes)} notes for user {user_id}"
+            )
+            for post_item in notes:
+                scanned_note_count += 1
+                if not self._creator_note_summary_matches_type(post_item):
+                    continue
+
+                note_detail = await self.get_note_detail_async_task(
+                    note_id=post_item.get("note_id"),
+                    xsec_source=post_item.get("xsec_source"),
+                    xsec_token=post_item.get("xsec_token"),
+                    semaphore=detail_semaphore,
+                )
+                if not note_detail or not self._creator_note_matches_type(note_detail):
+                    continue
+
+                selected_note_details.append(note_detail)
+                utils.logger.info(
+                    "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                    f"Selected latest note {len(selected_note_details)}/{target_count}: "
+                    f"{note_detail.get('note_id')}"
+                )
                 await xhs_store.update_xhs_note(note_detail)
                 await self.get_notice_media(note_detail)
+                if len(selected_note_details) >= target_count:
+                    break
+
+            if len(selected_note_details) >= target_count:
+                break
+
+            if notes_has_more and crawl_interval > 0:
+                await asyncio.sleep(crawl_interval)
+                utils.logger.info(
+                    "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+                    f"Sleeping for {crawl_interval} seconds before creator page {page_number + 1}"
+                )
+            page_number += 1
+
+        utils.logger.info(
+            "[XiaoHongShuCrawler.collect_creator_latest_notes] "
+            f"Selected {len(selected_note_details)} notes after scanning {scanned_note_count} creator notes"
+        )
+        return selected_note_details
+
+    def _creator_note_summary_matches_type(self, note_item: Dict) -> bool:
+        note_type = str(getattr(config, "XHS_CREATOR_NOTE_TYPE", "video") or "video").lower()
+        if note_type == "all":
+            return True
+
+        summary_type = str(note_item.get("type") or "").lower()
+        if not summary_type:
+            return True
+        return summary_type == note_type
+
+    def _creator_note_matches_type(self, note_detail: Dict) -> bool:
+        note_type = str(getattr(config, "XHS_CREATOR_NOTE_TYPE", "video") or "video").lower()
+        if note_type == "all":
+            return True
+        return str(note_detail.get("type") or "").lower() == note_type
 
     async def get_specified_notes(self):
         """Get the information and comments of the specified post
@@ -352,27 +406,65 @@ class XiaoHongShuCrawler(AbstractCrawler):
         utils.logger.info(f"[get_note_detail_async_task] Begin get note detail, note_id: {note_id}")
         async with semaphore:
             try:
+                heartbeat_sec = float(getattr(config, "XHS_NOTE_DETAIL_PROGRESS_HEARTBEAT_SEC", 10) or 0)
+                api_timeout_sec = float(getattr(config, "XHS_NOTE_DETAIL_API_TIMEOUT_SEC", 20) or 0)
+                html_timeout_sec = float(getattr(config, "XHS_NOTE_DETAIL_HTML_TIMEOUT_SEC", 20) or 0)
+
                 try:
-                    note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
+                    utils.logger.info(
+                        f"[get_note_detail_async_task] Requesting API detail for note {note_id}"
+                    )
+                    note_detail = await self.await_note_detail_stage(
+                        coro=self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token),
+                        note_id=note_id,
+                        stage_name="api-detail",
+                        timeout_sec=api_timeout_sec,
+                        heartbeat_sec=heartbeat_sec,
+                    )
                 except RetryError:
                     pass
+                except asyncio.TimeoutError:
+                    utils.logger.warning(
+                        f"[get_note_detail_async_task] API detail timed out for note {note_id}, switching to HTML fallback"
+                    )
 
                 if not note_detail:
-                    note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
-                                                                                 enable_cookie=True)
+                    utils.logger.info(
+                        f"[get_note_detail_async_task] Requesting HTML fallback detail for note {note_id}"
+                    )
+                    note_detail = await self.await_note_detail_stage(
+                        coro=self.xhs_client.get_note_by_id_from_html(
+                            note_id,
+                            xsec_source,
+                            xsec_token,
+                            enable_cookie=True,
+                        ),
+                        note_id=note_id,
+                        stage_name="html-detail",
+                        timeout_sec=html_timeout_sec,
+                        heartbeat_sec=heartbeat_sec,
+                    )
                     if not note_detail:
                         raise Exception(f"[get_note_detail_async_task] Failed to get note detail, Id: {note_id}")
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
 
-                # Sleep after fetching note detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+                detail_sleep_sec = float(getattr(config, "XHS_NOTE_DETAIL_SLEEP_SEC", 0.3) or 0)
+                if detail_sleep_sec > 0:
+                    await asyncio.sleep(detail_sleep_sec)
+                    utils.logger.info(
+                        f"[get_note_detail_async_task] Sleeping for {detail_sleep_sec} seconds after fetching note {note_id}"
+                    )
 
                 return note_detail
 
             except NoteNotFoundError as ex:
                 utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note not found: {note_id}, {ex}")
+                return None
+            except asyncio.TimeoutError:
+                utils.logger.warning(
+                    f"[XiaoHongShuCrawler.get_note_detail_async_task] Timed out getting note detail: {note_id}"
+                )
                 return None
             except DataFetchError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error: {ex}")
@@ -380,6 +472,52 @@ class XiaoHongShuCrawler(AbstractCrawler):
             except KeyError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
                 return None
+
+    async def await_note_detail_stage(
+        self,
+        coro,
+        note_id: str,
+        stage_name: str,
+        timeout_sec: float,
+        heartbeat_sec: float,
+    ):
+        """Await one note-detail stage with heartbeat logs and a hard timeout."""
+        task = asyncio.create_task(coro)
+        waited_sec = 0.0
+
+        try:
+            while True:
+                if task.done():
+                    return await task
+
+                wait_timeout = heartbeat_sec if heartbeat_sec > 0 else timeout_sec
+                if timeout_sec > 0:
+                    remaining_sec = timeout_sec - waited_sec
+                    if remaining_sec <= 0:
+                        raise asyncio.TimeoutError(
+                            f"{stage_name} timed out for note {note_id} after {timeout_sec} seconds"
+                        )
+                    if wait_timeout <= 0 or wait_timeout > remaining_sec:
+                        wait_timeout = remaining_sec
+
+                done, _ = await asyncio.wait({task}, timeout=wait_timeout)
+                if task in done:
+                    return await task
+
+                waited_sec += wait_timeout
+                utils.logger.info(
+                    f"[await_note_detail_stage] Still waiting {waited_sec:.1f}s for {stage_name}, note_id: {note_id}"
+                )
+
+                if timeout_sec > 0 and waited_sec >= timeout_sec:
+                    raise asyncio.TimeoutError(
+                        f"{stage_name} timed out for note {note_id} after {timeout_sec} seconds"
+                    )
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""

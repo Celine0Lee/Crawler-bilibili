@@ -36,18 +36,27 @@ XHS_CREATOR_ID_LIST = [
     # ........................
 ]
 
-# creator mode: only keep notes published within the last N days
-XHS_CREATOR_NOTE_LOOKBACK_DAYS = 365
-
-# creator mode: keep the top N notes sorted by likes for each creator
-XHS_CREATOR_TOP_LIKED_COUNT = 5
+# creator mode: keep the latest N notes for each creator
+XHS_CREATOR_LATEST_COUNT = 5
 
 # creator mode: "video" | "normal" | "all"
 XHS_CREATOR_NOTE_TYPE = "video"
 
-# creator mode: crawl all posts within the lookback window, then rank them by likes.
-XHS_CREATOR_FETCH_ALL_WITHIN_LOOKBACK = True
-
 # Safety cap for creator mode to avoid excessive requests on high-volume accounts.
-XHS_CREATOR_MAX_CRAWL_COUNT = 300
+XHS_CREATOR_MAX_CRAWL_COUNT = 180
+
+# XHS note-detail stage concurrency. Keep modest to balance speed and risk control.
+XHS_NOTE_DETAIL_MAX_CONCURRENCY = 1
+
+# Hard timeout for one XHS note API-detail stage (seconds).
+XHS_NOTE_DETAIL_API_TIMEOUT_SEC = 20
+
+# Hard timeout for one XHS note HTML-fallback stage (seconds).
+XHS_NOTE_DETAIL_HTML_TIMEOUT_SEC = 20
+
+# Heartbeat log interval while waiting on a slow note-detail request (seconds).
+XHS_NOTE_DETAIL_PROGRESS_HEARTBEAT_SEC = 10
+
+# Sleep after each XHS note detail request (seconds). Keep lower than comment crawling.
+XHS_NOTE_DETAIL_SLEEP_SEC = 3
 
